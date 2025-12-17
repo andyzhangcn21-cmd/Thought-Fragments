@@ -1,0 +1,301 @@
+\documentclass{article}
+
+\usepackage{arxiv}
+
+% ArXiv-style packages
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{microtype}
+\usepackage{graphicx}
+\usepackage{listings}
+\usepackage{textgreek} % 用于希腊字母
+
+\lstset{
+	basicstyle=\ttfamily,
+	columns=fullflexible,
+	keepspaces=true,
+	mathescape=true
+}
+\graphicspath{ {./images/} }
+
+% Remove \includegraphics to comply with request
+% \usepackage[export]{adjustbox} % Might be included but not used
+
+% Title and Author Information
+\title{GAPar: A Group-Theoretic Framework for\\ Symmetry-Aware Parallel Computing}
+\author{
+	Di Zhang \\
+	School of AI and Advanced Computing \\
+	Xi'an Jiaotong-Liverpool University \\
+	Suzhou, Jiangsu, China \\
+	\texttt{di.zhang@xjtlu.edu.cn}
+}
+
+
+% Theorem environments (optional, for formal definitions)
+\newtheorem{definition}{Definition}
+\newtheorem{principle}{Principle}
+
+\begin{document}
+	
+	\maketitle
+	
+	\begin{abstract}
+		Modern parallel computing frameworks, such as the Message Passing Interface (MPI), provide low-level primitives for communication but lack high-level abstractions for exploiting the inherent symmetries present in many scientific and machine learning problems. This forces programmers to manually map algorithmic symmetry onto process topologies, leading to complex, error-prone code and suboptimal performance, especially when symmetry is broken or system faults occur. This paper introduces \textsc{GAPar}, a novel parallel computing framework grounded in computational group theory. \textsc{GAPar} allows programmers to declaratively specify the algebraic symmetry of their problem. The framework then automates key aspects of parallelization, including domain decomposition, communication scheduling, and load balancing, by leveraging the structure of the specified group and its action on the computational domain. We present the design philosophy and a concrete implementation blueprint for \textsc{GAPar}, contrast it with topology-based approaches like MPI, and demonstrate its expressiveness and potential for performance optimization through two concrete examples: a symmetric heat equation solver and a Graph Neural Network (GNN) operating on highly symmetric graphs. Our conceptual analysis suggests that \textsc{GAPar} can significantly reduce development complexity while enabling sophisticated, dynamic optimizations that are infeasible with current paradigms.
+	\end{abstract}
+	
+	\section{Introduction}
+	\label{sec:introduction}
+	
+	Parallel computing is the cornerstone of high-performance scientific simulation and large-scale machine learning. The dominant programming model for distributed-memory systems, the Message Passing Interface (MPI) \cite{mpi}, provides a portable and powerful set of primitives. While MPI offers constructs like \textsc{Cartesian} topologies to map processes to geometric grids, its abstraction level remains low. Programmers are responsible for explicitly managing data decomposition, inter-process communication, and synchronization, which often results in code that is verbose, difficult to maintain, and brittle to changes in problem parameters or system state.
+	
+	A significant class of computational problems—from molecular dynamics and computational fluid dynamics to graph processing on structured networks—exhibits profound mathematical \textit{symmetry}. These symmetries can be described formally by \textit{groups} and their \textit{actions} on the computational domain. For instance, a square computational mesh is invariant under the dihedral group $D_4$, and a graph may possess a non-trivial automorphism group. Current parallel frameworks are \textit{symmetry-agnostic}; any exploitation of this structure is ad-hoc, manual, and hard-coded by the programmer. This leads to several shortcomings:
+	\begin{itemize}
+		\item \textbf{Development Complexity}: Manual implementation of ghost layer exchanges and collective operations in MPI is tedious and error-prone.
+		\item \textbf{Suboptimal Performance}: Static decompositions may not adapt to runtime symmetry breaking (e.g., localized phenomena).
+		\item \textbf{Lack of Resilience}: A single process failure typically crashes the entire application, as the framework has no structural understanding of task redundancy introduced by symmetry.
+	\end{itemize}
+	
+	This paper proposes a paradigm shift: a parallel computing framework where the programmer declaratively specifies the problem's symmetry group, and the runtime automatically derives an efficient parallel execution plan. We present the design and a concrete implementation blueprint for \textsc{GAPar} (Group-based Adaptive Parallelism), a framework that uses computational group theory as its foundational abstraction. By elevating symmetry from an implicit property to a first-class citizen, \textsc{GAPar} aims to simplify parallel programming, enhance performance portability, and introduce novel capabilities for adaptive load balancing and fault tolerance.
+	
+	\section{Background and Related Work}
+	\label{sec:related}
+	
+	\subsection{Topology-Based Parallelism with MPI}
+	MPI's \texttt{MPI\_Cart\_create} allows for the logical arrangement of processes in a grid. This is useful for structuring communication in problems like finite difference stencils. However, an MPI topology is merely a \textit{labeling} of processes; it has no semantic understanding of the geometry or symmetry it is meant to represent. Communication patterns (e.g., \texttt{MPI\_Sendrecv} for ghost cell exchanges) must be explicitly coded by the developer. Frameworks like PETSc \cite{petsc} provide higher-level abstractions for linear algebra and meshes but still rely on the programmer to define the decomposition and do not formally reason about symmetry.
+	
+	\subsection{Computational Group Theory}
+	Computational Group Theory (CGT) is a well-established field concerned with developing algorithms for solving problems in group theory \cite{handbookCGT}. Software systems like GAP \cite{GAP4} and Magma are capable of computing properties of large finite groups, such as subgroups, conjugacy classes, and automorphisms. The application of CGT to parallel computing has been mostly confined to specialized domains, such as enumerating combinatorial objects or solving specific problems like graph isomorphism \cite{luks}. \textsc{GAPar} seeks to generalize this connection, using CGT as a core runtime component for general-purpose parallel computing.
+	
+	\subsection{Symmetry in Computing}
+	The use of symmetry to reduce computational cost is a classic technique, often called "symmetry breaking" in constraint satisfaction or "exploiting fundamental domains" in physics. In high-performance computing, it is typically done manually. Recent work in Machine Learning, specifically on Equivariant Neural Networks \cite{equivariantNN}, has formalized the use of group theory in model architecture design to guarantee equivariance to input transformations. \textsc{GAPar} draws inspiration from this philosophy but applies it to the parallelization process itself, aiming for \textit{parallelization-equivariance} to the problem's symmetry group.
+	
+	\section{The GAPar Design}
+	\label{sec:design}
+	
+	The core thesis of \textsc{GAPar} is that by expressing a problem's symmetry through a group $G$ and its action on a domain $X$, the framework can automate decomposition, communication, and optimization.
+	
+	\subsection{Core Abstractions}
+	
+	\begin{definition}[Symmetry Group Declaration]
+		The programmer specifies the problem's symmetry group $G$ (e.g., a cyclic group $C_n$, dihedral group $D_n$, or a permutation group). This can be done by name for common groups or via generators.
+	\end{definition}
+	
+	\begin{definition}[Domain and Group Action]
+		The computational domain $X$ (e.g., a mesh, a graph) is defined. The programmer specifies how $G$ \textit{acts} on $X$ (i.e., how elements $g \in G$ transform points $x \in X$). The field data (e.g., temperature, node features) is tagged with its \textit{transformation type} (scalar, vector, etc.) under this action.
+	\end{definition}
+	
+	\subsection{System Architecture}
+	
+	\textsc{GAPar}'s runtime consists of several key components:
+	
+	\begin{enumerate}
+		\item \textbf{Symmetry Analyzer}: Accepts the user's declarative specification of $G$ and its action on $X$. It uses an integrated CGT library (e.g., a GAP interface) to compute group properties like generators, subgroups, and orbits.
+		\item \textbf{Decomposition Engine}: Partitions the domain $X$ into regions corresponding to the \textit{orbits} of a chosen subgroup of $G$. A standard choice is to partition $X$ into a set of \textit{fundamental domains}, where each process computes the solution for one representative from each orbit. This guarantees load balance for the symmetric case.
+		\item \textbf{Communication Manager}: Derives necessary communication from the group's \textit{Cayley graph} defined by its generators. For example, a ghost cell exchange corresponds to communicating with processes associated with the action of group generators on the local domain. It can employ optimized, persistent communication channels based on this graph.
+		\item \textbf{Dynamic Optimizer}: Monitors application state. If symmetry is broken (e.g., load imbalance is detected), it can recompute the decomposition based on a smaller \textit{subgroup} of $G$ that remains relevant, dynamically redistributing work.
+	\end{enumerate}
+	
+	\subsection{Contrast with MPI's Topology Approach}
+	
+	The difference is fundamental. In MPI, a 2D grid topology is a static map. In \textsc{GAPar}, a dihedral group $D_4$ action is a \textit{dynamic specification of allowable transformations}.
+	
+	\begin{itemize}
+		\item \textbf{Decomposition}: MPI: Manual choice of \texttt{dims[2]}. \textsc{GAPar}: Automatic derivation from the orbit structure of $G$.
+		\item \textbf{Communication}: MPI: Manual \texttt{Sendrecv} calls for neighbors. \textsc{GAPar}: Automatic derivation from group generators.
+		\item \textbf{Optimization}: MPI: Static. \textsc{GAPar}: Can dynamically reconfigure based on algebraic structure (e.g., falling back to a cyclic subgroup $C_2$ if reflection symmetry is broken).
+	\end{itemize}
+	
+	\section{Implementation Blueprint}
+	\label{sec:implementation}
+	
+	Translating the \textsc{GAPar} design into a functional library requires a layered architecture that bridges abstract algebra and high-performance computing. We propose a concrete implementation strategy based on four layers.
+	
+	\subsection{Layer 1: Core Abstraction and CGT Binding}
+	
+	This layer provides the foundational C++ classes (or Python equivalents with C++ bindings for performance) and interfaces with a CGT backend.
+	
+	\begin{itemize}
+		\item \textbf{Class \texttt{Group}}: An abstract base class representing a finite group. Concrete subclasses (\texttt{FiniteGroup}, \texttt{PermutationGroup}) would wrap an embedded CGT library like \textbf{GAP} via its C library interface (libgap) or a system call. Key methods include:
+		\begin{verbatim}
+			class Group {
+				std::vector<GroupElement> generators();
+				std::vector<GroupElement> elements();
+				Subgroup lattice();
+				GroupElement compose(GroupElement a, GroupElement b);
+				// ... 
+			};
+		\end{verbatim}
+		\item \textbf{Class \texttt{GroupAction}}: Encapsulates the action of a \texttt{Group} on a \texttt{Domain}. For a grid, this would apply rotations/reflections; for a graph, it would permute nodes.
+		\begin{verbatim}
+			class GroupAction {
+				DomainElement act(GroupElement g, DomainElement x);
+				std::vector<Orbit> compute_orbits();
+				bool is_fundamental_domain(Subset S);
+			};
+		\end{verbatim}
+		\item \textbf{Initialization}: For common groups ($C_n$, $D_n$), predefined specifications can be loaded. For graphs, an initial, potentially expensive, automorphism group computation using a library like \textbf{Bliss} or \textbf{Nauty} is performed during setup.
+	\end{itemize}
+	
+	\subsection{Layer 2: Decomposition and Metadata Management}
+	
+	This layer uses the algebraic structures from Layer 1 to partition the problem.
+	
+	\begin{itemize}
+		\item \textbf{Class \texttt{DecompositionStrategy}}: An interface for different partitioning schemes (e.g., \texttt{OrbitDecomposition}, \texttt{FundamentalDomainDecomposition}).
+		\item \textbf{Process-Orbit Mapping}: The primary strategy maps each orbit (or a union of orbits) to an MPI process. This creates a \texttt{std::map<ProcessRank, std::vector<Orbit>>}. The framework ensures that the image of any local data under a group generator is sent to the correct process.
+		\item \textbf{Metadata Storage}: Each process stores:
+		\begin{enumerate}
+			\item Its \textit{local} set of domain elements (e.g., grid points, graph nodes).
+			\item The \textit{ghost} elements, which are the images of its local boundary under the group's generating set.
+			\item A \texttt{std::map<DomainElement, ProcessRank>} to locate the owner of any ghost element.
+		\end{enumerate}
+	\end{itemize}
+	
+	\subsection{Layer 3: Communication Engine}
+	
+	This is the performance-critical core that replaces manual \texttt{Sendrecv} logic.
+	
+	\begin{itemize}
+		\item \textbf{Cayley Graph Derivation}: The framework constructs the Cayley graph of the group $G$ with respect to its generating set $S$. Each process is associated with a vertex in this graph (or a coset, depending on decomposition).
+		\item \textbf{Persistent Communication Channels}: For stencil-based computations (Example \ref{ex:heat}), the framework pre-computes and establishes \texttt{MPI\_Send\_init} and \texttt{MPI\_Recv\_init} for each generator in $S$. This minimizes communication overhead per iteration.
+		\item \textbf{Collective Operations}: Operations like \textsc{Reduce} can be optimized. A reduction over the entire domain can be performed by first reducing within orbits (which are structurally identical) and then combining the results, potentially reducing communication volume.
+		\item \textbf{API}: The user-facing API is simple:
+		\begin{verbatim}
+			Decomposition decomp = ...;
+			auto comm_handle = decomp.create_communicator();
+			comm_handle.start_ghost_exchange(local_field); // Non-blocking
+			comm_handle.finish_ghost_exchange();
+		\end{verbatim}
+		The framework handles all rank tagging and synchronization.
+	\end{itemize}
+	
+	\subsection{Layer 4: Runtime and Dynamic Optimizer}
+	
+	This layer enables \textsc{GAPar}'s adaptive behavior.
+	
+	\begin{itemize}
+		\item \textbf{Performance Monitoring}: The runtime periodically samples computation time per process. A significant deviation indicates symmetry breaking.
+		\item \textbf{Subgroup Detection}: Upon detecting imbalance, the optimizer analyzes the load distribution. It then queries the \texttt{Group} object from Layer 1 for a maximal subgroup $H$ that is consistent with the current load pattern. For instance, if a hotspot breaks reflection symmetry but preserves 180° rotation, it identifies $H = C_2$.
+		\item \textbf{Dynamic Recomposition}: The framework triggers a recomputation of the decomposition using $H$ instead of $G$. This involves:
+		\begin{enumerate}
+			\item Computing the new orbits under $H$ (which are larger than those under $G$).
+			\item Redistributing data according to the new orbit-process map using MPI collective communication.
+			\item Rebuilding the communication channels in Layer 3 based on the generators of $H$.
+		\end{enumerate}
+		This process is costly but is amortized over long-running simulations where performance degradation would otherwise be permanent.
+	\end{itemize}
+	
+	\subsection{Prototyping Path}
+	
+	A viable path is to first implement a prototype in Python, leveraging \texttt{mpi4py} and the GAP system through a pipe or library call. This allows for rapid validation of the core concepts (decomposition, communication derivation) on small problems. The performance-critical components (Communication Engine, Layer 3) can then be incrementally rewritten in C++/MPI for production use.
+	
+	\section{Conceptual Examples}
+	\label{sec:examples}
+	
+	\subsection{Example 1: 2D Heat Equation on a Square Domain}
+	\label{ex:heat}
+	
+	\textbf{Problem}: Solve the 2D heat equation on a square domain with initial central hotspot. The domain has $D_4$ symmetry.
+	
+	\begin{itemize}
+		\item \textbf{MPI+Topology Approach}: The programmer creates a 2D Cartesian topology, manually divides the global grid into $P \times P$ subgrids, and writes explicit \texttt{Sendrecv} logic for North, South, East, West neighbors. Code is long and rigid.
+		\item \textbf{\textsc{GAPar} Approach}:
+		\begin{verbatim}
+			// Declarative Specification
+			Group G = DihedralGroup(4);
+			Domain X = SquareGrid(1000, 1000);
+			Field temperature = ScalarField(X, G);
+			
+			// Computational Kernel (User focuses on physics)
+			@kernel void stencil(Field t_new, Field t_old) { ... }
+			
+			// Runtime automates the rest
+			Decomposition decomp = GAPar.decompose(X, G);
+			decomp.execute(stencil, temperature);
+		\end{verbatim}
+		\textbf{Advantages}:
+		\begin{enumerate}
+			\item \textbf{Simplicity}: Code is reduced to its essentials. No communication logic.
+			\item \textbf{Correctness}: Ghost exchanges are handled correctly by the framework.
+			\item \textbf{Adaptivity}: If the hotspot moves off-center, breaking $D_4$ symmetry, \textsc{GAPar} can detect load imbalance and dynamically reconfigure the decomposition based on the remaining $C_2$ (180° rotation) symmetry, redistributing work without programmer intervention.
+		\end{enumerate}
+	\end{itemize}
+	
+	\subsection{Example 2: Graph Neural Network on a Symmetric Graph}
+	\label{ex:gnn}
+	
+	\textbf{Problem}: Train a GNN on a graph $\Gamma$ with a large automorphism group $\text{Aut}(\Gamma)$ (e.g., a circular ladder graph).
+	
+	\begin{itemize}
+		\item \textbf{MPI+Topology Approach}: The programmer uses a generic graph partitioning library (e.g., Metis) to partition the nodes, minimizing edge cuts. The resulting partition is arbitrary with respect to the graph's symmetry, leading to potentially unnecessary communication. Managing node/edge feature aggregation across partitions requires complex book-keeping.
+		\item \textbf{\textsc{GAPar} Approach}:
+		\begin{verbatim}
+			Graph Γ = load_graph("symmetric_graph.gml");
+			Group G = GAPar.compute_automorphism_group(Γ); // Uses Nauty/Traces
+			Domain X = Γ; // The domain is the graph itself
+			Field node_features = GraphField(X, G); // Features are permuted by G
+			
+			@kernel void gnn_layer(Field h_new, Field h_old) {
+				// For each node, aggregate messages from neighbors
+				for_node n in local_nodes {
+					h_new[n] = AGGREGATE( h_old[neighbors(n)] );
+				}
+			}
+			
+			Decomposition decomp = GAPar.decompose(Γ, G);
+			decomp.execute(gnn_layer, node_features);
+		\end{verbatim}
+		\textbf{Advantages}:
+		\begin{enumerate}
+			\item \textbf{Exploited Redundancy}: \textsc{GAPar} partitions the graph into orbits of $\text{Aut}(\Gamma)$. Nodes in the same orbit are structurally identical and can be processed by the same process, or their computations can be efficiently replicated without storage overhead for features.
+			\item \textbf{Optimal Communication}: The communication pattern for message passing is derived from the group action, ensuring that only non-redundant, necessary data is exchanged.
+			\item \textbf{Fault Tolerance}: If a process managing one orbit fails, its work can be reassigned to the process managing a symmetric orbit, as the computation is identical, enabling graceful degradation.
+		\end{enumerate}
+	\end{itemize}
+	
+	\section{Conclusion and Future Work}
+	\label{sec:conclusion}
+	
+	We have presented the vision and a concrete implementation blueprint for \textsc{GAPar}, a parallel computing framework that uses group theory as a first-class abstraction. By moving from an imperative, topology-based model to a declarative, symmetry-based one, \textsc{GAPar} has the potential to dramatically simplify the development of parallel applications for a vast class of symmetric problems. The implementation strategy, layered around a CGT core, demonstrates the feasibility of this approach. The examples in Section~\ref{sec:examples} illustrate the framework's promise in reducing code complexity, enabling dynamic optimizations, and providing inherent fault tolerance.
+	
+	The path forward involves several challenging but exciting research directions. A full-fledged prototype of \textsc{GAPar} must be implemented, integrating a CGT library with a parallel runtime. The performance overhead of online symmetry analysis must be evaluated against its benefits. The framework needs to be extended to handle more complex group actions and hybrid scenarios with broken symmetry. Finally, formalizing the concept of "parallelization-equivariance" and exploring its integration with equivariant machine learning models presents a compelling long-term research agenda. \textsc{GAPar} is not merely an incremental improvement but a step towards a more intelligent and algebraic foundation for parallel computing.
+	
+\begin{thebibliography}{10}
+	
+	\bibitem{mpi}
+	Message Passing Interface Forum.
+	\newblock MPI: A Message-Passing Interface Standard, Version 4.0, 2021.
+	\newblock \url{https://www.mpi-forum.org/docs/mpi-4.0/mpi40-report.pdf}.
+	
+	\bibitem{petsc}
+	Satish Balay and others.
+	\newblock {PETSc Users Manual}.
+	\newblock Technical Report ANL-95/11 - Revision 3.19, Argonne National Laboratory, 2022.
+	
+	\bibitem{handbookCGT}
+	Derek F. Holt, Bettina Eick, and Eamonn A. O'Brien.
+	\newblock \emph{Handbook of Computational Group Theory}.
+	\newblock Chapman and Hall/CRC, 2005.
+	
+	\bibitem{GAP4}
+	{GAP -- Groups, Algorithms, and Programming, Version 4.12.2}.
+	\newblock The GAP Group, 2022.
+	\newblock \url{https://www.gap-system.org}.
+	
+	\bibitem{luks}
+	Eugene M. Luks.
+	\newblock Isomorphism of graphs of bounded valence can be tested in polynomial time.
+	\newblock \emph{Journal of Computer and System Sciences}, 25(1):42--65, 1982.
+	
+	\bibitem{equivariantNN}
+	Taco S. Cohen and Max Welling.
+	\newblock Group Equivariant Convolutional Networks.
+	\newblock In \emph{Proceedings of the 33rd International Conference on Machine Learning}, 2016.
+	
+\end{thebibliography}
+
+\end{document}
